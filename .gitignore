@@ -1,0 +1,15 @@
+.idea/
+.vscode/
+*.swp
+*.iml
+
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+Thumbs.db
+.DS_Store
