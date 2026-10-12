@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
+	"sync"
 	"syscall"
 	"time"
 
@@ -13,16 +16,23 @@ import (
 )
 
 func main() {
+	runtime.GOMAXPROCS(1)
+	debug.SetMemoryLimit(24 * 1024 * 1024)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	storage := limiter.NewStorage()
-	storage.StartCleaner(ctx, 10*time.Second, 1*time.Minute)
+	var wg sync.WaitGroup
+
+	storage := limiter.NewStorage(1000)
+	storage.StartCleaner(ctx, &wg, 5*time.Second)
 
 	srv := server.New("127.0.0.1:8080", storage)
 
 	if err := srv.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Fatal error: %v\n", err)
-		os.Exit(1)
 	}
+
+	wg.Wait()
+	fmt.Println("Server and cleaner shut down cleanly.")
 }
