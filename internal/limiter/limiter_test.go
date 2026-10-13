@@ -48,12 +48,36 @@ func TestStorage_HardCap(t *testing.T) {
 	if !s.Allow(collidingKeys[0], 5.0, 1.0) {
 		t.Fatal("client 1 should be allowed")
 	}
+	time.Sleep(1 * time.Millisecond)
+
 	if !s.Allow(collidingKeys[1], 5.0, 1.0) {
 		t.Fatal("client 2 should be allowed")
 	}
+	time.Sleep(1 * time.Millisecond)
 
-	if !s.Allow(collidingKeys[0], 5.0, 1.0) {
-		t.Fatal("existing client 1 should still be served")
+	if !s.Allow(collidingKeys[2], 5.0, 1.0) {
+		t.Fatal("client 3 should be allowed by evicting the oldest idle entry")
+	}
+
+	if s.Allow(collidingKeys[2], 5.0, 1.0) {
+		t.Fatal("client 3 entered under saturation and must NOT be allowed to burst")
+	}
+
+	sh := s.getShard(collidingKeys[0])
+	sh.mu.Lock()
+	currentCount := len(sh.buckets)
+	_, client0Exists := sh.buckets[collidingKeys[0]]
+	_, client2Exists := sh.buckets[collidingKeys[2]]
+	sh.mu.Unlock()
+
+	if currentCount > 2 {
+		t.Fatalf("shard capacity exceeded: got %d, max 2", currentCount)
+	}
+	if client0Exists {
+		t.Fatal("client 0 was the oldest and must have been evicted")
+	}
+	if !client2Exists {
+		t.Fatal("client 2 is the new client and must be present in the shard")
 	}
 }
 

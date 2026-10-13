@@ -111,20 +111,24 @@ func (s *Storage) Allow(key IPKey, maxTokens float64, refillRate float64) bool {
 	defer sh.mu.Unlock()
 
 	now := time.Since(processStart).Nanoseconds()
+	isOverloaded := s.maxEntryPerShard > 0 && len(sh.buckets) >= (s.maxEntryPerShard*9)/10
+
+	effectiveMax := maxTokens
+	if isOverloaded {
+		effectiveMax = 1.0
+	}
 
 	b, exists := sh.buckets[key]
 	if !exists {
 		if s.maxEntryPerShard > 0 && len(sh.buckets) >= s.maxEntryPerShard {
-			var safeKey IPKey
-			var foundSafe bool
+			var oldestKey IPKey
+			var oldestTime int64 = math.MaxInt64
 			checked := 0
 
 			for k, candidate := range sh.buckets {
-				elapsed := float64(now-candidate.lastUpdate) / 1e9
-				if (candidate.tokens + elapsed*refillRate) >= maxTokens {
-					safeKey = k
-					foundSafe = true
-					break
+				if candidate.lastUpdate < oldestTime {
+					oldestTime = candidate.lastUpdate
+					oldestKey = k
 				}
 				checked++
 				if checked >= 3 {
@@ -132,15 +136,16 @@ func (s *Storage) Allow(key IPKey, maxTokens float64, refillRate float64) bool {
 				}
 			}
 
-			if foundSafe {
-				delete(sh.buckets, safeKey)
-			} else {
-				return false
-			}
+			delete(sh.buckets, oldestKey)
+		}
+
+		initialTokens := maxTokens - 1.0
+		if isOverloaded {
+			initialTokens = 0.0
 		}
 
 		sh.buckets[key] = bucketData{
-			tokens:     maxTokens - 1.0,
+			tokens:     initialTokens,
 			lastUpdate: now,
 		}
 		return true
@@ -150,8 +155,9 @@ func (s *Storage) Allow(key IPKey, maxTokens float64, refillRate float64) bool {
 	if delta > 0 {
 		deltaInSeconds := float64(delta) / 1e9
 		b.tokens += deltaInSeconds * refillRate
-		if b.tokens > maxTokens {
-			b.tokens = maxTokens
+
+		if b.tokens > effectiveMax {
+			b.tokens = effectiveMax
 		}
 		b.lastUpdate = now
 	}

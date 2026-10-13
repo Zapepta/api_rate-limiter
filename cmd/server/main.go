@@ -27,7 +27,7 @@ func main() {
 	storage := limiter.NewStorage(1000)
 	storage.StartCleaner(ctx, &wg, 5*time.Second)
 
-	srv := server.New("127.0.0.1:8080", storage)
+	srv := server.New(":8080", storage)
 
 	if err := srv.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Fatal error: %v\n", err)

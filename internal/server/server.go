@@ -130,6 +130,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 func (s *Server) handleConnection(conn net.Conn) {
 	reader := bufio.NewReaderSize(conn, 128)
+	writer := bufio.NewWriterSize(conn, 256)
 	buf := make([]byte, maxLineLen)
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 
@@ -146,19 +147,23 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 
 		strLine := unsafe.String(unsafe.SliceData(line), len(line))
-
 		key, ok := parseIPToKey(strLine)
 		if !ok {
-			_, _ = conn.Write(respInvalid)
-			continue
-		}
-
-		if s.limiter.Allow(key, s.maxTokens, s.refillRate) {
-			if _, err := conn.Write(respOK); err != nil {
+			if _, err := writer.Write(respInvalid); err != nil {
+				return
+			}
+		} else if s.limiter.Allow(key, s.maxTokens, s.refillRate) {
+			if _, err := writer.Write(respOK); err != nil {
 				return
 			}
 		} else {
-			if _, err := conn.Write(respErr); err != nil {
+			if _, err := writer.Write(respErr); err != nil {
+				return
+			}
+		}
+
+		if reader.Buffered() == 0 {
+			if err := writer.Flush(); err != nil {
 				return
 			}
 		}

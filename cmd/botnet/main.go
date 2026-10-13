@@ -54,32 +54,33 @@ func main() {
 			endIP := startIP + botsPerWorker
 
 			for i := startIP; i < endIP; i++ {
-				// Генерируем уникальный IP для каждого бота
 				botIP := fmt.Sprintf("185.%d.%d.%d", (i>>16)&0xFF, (i>>8)&0xFF, i&0xFF)
+				
+				for req := 0; req < 3; req++ {
+					_, err := fmt.Fprintf(writer, "%s\n", botIP)
+					if err != nil {
+						atomic.AddUint64(&errors, 1)
+						return
+					}
 
-				_, err := fmt.Fprintf(writer, "%s\n", botIP)
-				if err != nil {
-					atomic.AddUint64(&errors, 1)
-					return
-				}
+					if err := writer.Flush(); err != nil {
+						atomic.AddUint64(&errors, 1)
+						return
+					}
 
-				if err := writer.Flush(); err != nil {
-					atomic.AddUint64(&errors, 1)
-					return
-				}
+					resp, err := reader.ReadString('\n')
+					if err != nil {
+						atomic.AddUint64(&errors, 1)
+						return
+					}
 
-				resp, err := reader.ReadString('\n')
-				if err != nil {
-					atomic.AddUint64(&errors, 1)
-					return
-				}
-
-				if strings.HasPrefix(resp, "+OK") {
-					atomic.AddUint64(&allowed, 1)
-				} else if strings.HasPrefix(resp, "-ERR") {
-					atomic.AddUint64(&rejected, 1)
-				} else {
-					atomic.AddUint64(&errors, 1)
+					if strings.HasPrefix(resp, "+OK") {
+						atomic.AddUint64(&allowed, 1)
+					} else if strings.HasPrefix(resp, "-ERR") {
+						atomic.AddUint64(&rejected, 1)
+					} else {
+						atomic.AddUint64(&errors, 1)
+					}
 				}
 			}
 		}(workerID)
