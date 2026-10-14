@@ -88,7 +88,11 @@ func MaskIPv6to64(raw [16]byte) [16]byte {
 
 func (s *Storage) hashKey(k IPKey) uint8 {
 	h := s.seed ^ 14695981039346656037
-	for i := 0; i < 16; i++ {
+	limit := 16
+	if k[10] == 0xff && k[11] == 0xff {
+		limit = 15
+	}
+	for i := 0; i < limit; i++ {
 		h ^= uint64(k[i])
 		h *= 1099511628211
 	}
@@ -113,12 +117,17 @@ func (s *Storage) Allow(key IPKey, maxTokens float64, refillRate float64) bool {
 	now := time.Since(processStart).Nanoseconds()
 	isOverloaded := s.maxEntryPerShard > 0 && len(sh.buckets) >= (s.maxEntryPerShard*9)/10
 
+	lookupKey := key
+	if isOverloaded && key[10] == 0xff && key[11] == 0xff {
+		lookupKey[15] = 0
+	}
+
 	effectiveMax := maxTokens
 	if isOverloaded {
 		effectiveMax = 1.0
 	}
 
-	b, exists := sh.buckets[key]
+	b, exists := sh.buckets[lookupKey]
 	if !exists {
 		if s.maxEntryPerShard > 0 && len(sh.buckets) >= s.maxEntryPerShard {
 			var oldestKey IPKey
@@ -144,7 +153,7 @@ func (s *Storage) Allow(key IPKey, maxTokens float64, refillRate float64) bool {
 			initialTokens = 0.0
 		}
 
-		sh.buckets[key] = bucketData{
+		sh.buckets[lookupKey] = bucketData{
 			tokens:     initialTokens,
 			lastUpdate: now,
 		}
@@ -164,11 +173,11 @@ func (s *Storage) Allow(key IPKey, maxTokens float64, refillRate float64) bool {
 
 	if b.tokens >= 1.0 {
 		b.tokens -= 1.0
-		sh.buckets[key] = b
+		sh.buckets[lookupKey] = b
 		return true
 	}
 
-	sh.buckets[key] = b
+	sh.buckets[lookupKey] = b
 	return false
 }
 

@@ -162,10 +162,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 		}
 
-		if reader.Buffered() == 0 {
-			if err := writer.Flush(); err != nil {
-				return
-			}
+		if err := writer.Flush(); err != nil {
+			return
 		}
 	}
 }

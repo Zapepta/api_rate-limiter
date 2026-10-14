@@ -35,14 +35,13 @@ func TestStorage_HardCap(t *testing.T) {
 	var collidingKeys []IPKey
 	targetShard := s.hashKey(IPv4Key(1))
 	collidingKeys = append(collidingKeys, IPv4Key(1))
-
-	var candidate uint32 = 2
+	var candidate uint32 = 256
 	for len(collidingKeys) < 3 {
 		k := IPv4Key(candidate)
 		if s.hashKey(k) == targetShard {
 			collidingKeys = append(collidingKeys, k)
 		}
-		candidate++
+		candidate += 256
 	}
 
 	if !s.Allow(collidingKeys[0], 5.0, 1.0) {
