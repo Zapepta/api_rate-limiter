@@ -71,7 +71,7 @@ func IPv4Key(ip uint32) IPKey {
 }
 
 func IPv6Key(raw [16]byte) IPKey {
-	return IPKey(raw)
+	return raw
 }
 
 func MaskIPv6to64(raw [16]byte) [16]byte {
