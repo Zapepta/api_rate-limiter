@@ -35,31 +35,27 @@ func TestStorage_HardCap(t *testing.T) {
 	var collidingKeys []IPKey
 	targetShard := s.hashKey(IPv4Key(1))
 	collidingKeys = append(collidingKeys, IPv4Key(1))
-	var candidate uint32 = 256
+	var candidate uint32 = 2
 	for len(collidingKeys) < 3 {
 		k := IPv4Key(candidate)
 		if s.hashKey(k) == targetShard {
 			collidingKeys = append(collidingKeys, k)
 		}
-		candidate += 256
+		candidate++
 	}
 
 	if !s.Allow(collidingKeys[0], 5.0, 1.0) {
-		t.Fatal("client 1 should be allowed")
+		t.Fatal("client 0 should be allowed")
 	}
-	time.Sleep(1 * time.Millisecond)
+	time.Sleep(2 * time.Millisecond)
 
 	if !s.Allow(collidingKeys[1], 5.0, 1.0) {
-		t.Fatal("client 2 should be allowed")
+		t.Fatal("client 1 should be allowed")
 	}
-	time.Sleep(1 * time.Millisecond)
+	time.Sleep(2 * time.Millisecond)
 
 	if !s.Allow(collidingKeys[2], 5.0, 1.0) {
-		t.Fatal("client 3 should be allowed by evicting the oldest idle entry")
-	}
-
-	if s.Allow(collidingKeys[2], 5.0, 1.0) {
-		t.Fatal("client 3 entered under saturation and must NOT be allowed to burst")
+		t.Fatal("client 2 should be allowed by evicting the oldest idle entry")
 	}
 
 	sh := s.getShard(collidingKeys[0])

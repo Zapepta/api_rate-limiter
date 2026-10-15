@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -20,6 +22,7 @@ var (
 	respOK      = []byte("+OK\r\n")
 	respErr     = []byte("-ERR Rate limit exceeded\r\n")
 	respInvalid = []byte("-ERR Invalid IP address\r\n")
+	respPong    = []byte("+PONG\r\n")
 )
 
 const (
@@ -33,6 +36,7 @@ type Limiter interface {
 }
 
 type Server struct {
+	network    string
 	addr       string
 	limiter    Limiter
 	maxTokens  float64
@@ -42,6 +46,17 @@ type Server struct {
 }
 
 func New(addr string, limiter Limiter, limits ...float64) *Server {
+	netType := "tcp"
+	if strings.HasPrefix(addr, "unix://") {
+		netType = "unix"
+		addr = strings.TrimPrefix(addr, "unix://")
+	} else if strings.HasPrefix(addr, "/") || strings.HasPrefix(addr, "./") || strings.HasSuffix(addr, ".sock") {
+		netType = "unix"
+	}
+	return NewWithNetwork(netType, addr, limiter, limits...)
+}
+
+func NewWithNetwork(network, addr string, limiter Limiter, limits ...float64) *Server {
 	maxTok := 5.0
 	refill := 1.0
 	if len(limits) >= 2 && limits[0] > 0 && limits[1] > 0 {
@@ -50,6 +65,7 @@ func New(addr string, limiter Limiter, limits ...float64) *Server {
 	}
 
 	return &Server{
+		network:    network,
 		addr:       addr,
 		limiter:    limiter,
 		maxTokens:  maxTok,
@@ -59,20 +75,35 @@ func New(addr string, limiter Limiter, limits ...float64) *Server {
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	listener, err := net.Listen("tcp", s.addr)
-	if err != nil {
-		return fmt.Errorf("failed to start listener: %w", err)
+	if s.network == "unix" {
+		_ = os.Remove(s.addr)
 	}
-	defer listener.Close()
 
-	fmt.Printf("TCP rate-limiter daemon listening on %s\n", s.addr)
+	listener, err := net.Listen(s.network, s.addr)
+	if err != nil {
+		return fmt.Errorf("failed to start %s listener on %s: %w", s.network, s.addr, err)
+	}
+	defer func() {
+		_ = listener.Close()
+		if s.network == "unix" {
+			_ = os.Remove(s.addr)
+		}
+	}()
+
+	if s.network == "unix" {
+		_ = os.Chmod(s.addr, 0666)
+	}
+
+	fmt.Printf("Rate-limiter daemon listening on [%s] %s\n", s.network, s.addr)
 
 	var wg sync.WaitGroup
 
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
-
+		if s.network == "unix" {
+			_ = os.Remove(s.addr)
+		}
 		s.conns.Range(func(key, _ any) bool {
 			if conn, ok := key.(net.Conn); ok {
 				_ = conn.Close()
@@ -89,7 +120,6 @@ func (s *Server) Run(ctx context.Context) error {
 			if errors.Is(err, net.ErrClosed) {
 				break
 			}
-
 			if tempDelay == 0 {
 				tempDelay = 5 * time.Millisecond
 			} else {
@@ -129,20 +159,34 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
-	reader := bufio.NewReaderSize(conn, 128)
-	writer := bufio.NewWriterSize(conn, 256)
-	buf := make([]byte, maxLineLen)
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	reader := bufio.NewReaderSize(conn, 2048)
+	writer := bufio.NewWriterSize(conn, 2048)
+	_ = conn.SetDeadline(time.Now().Add(idleTimeout))
 
 	for {
-		n, err := readLineBounded(reader, buf)
+		if reader.Buffered() == 0 {
+			_ = conn.SetDeadline(time.Now().Add(idleTimeout))
+		}
+
+		rawLine, err := reader.ReadSlice('\n')
 		if err != nil {
 			return
 		}
 
-		_ = conn.SetDeadline(time.Now().Add(idleTimeout))
-		line := bytes.TrimSpace(buf[:n])
+		line := bytes.TrimSpace(rawLine)
 		if len(line) == 0 {
+			continue
+		}
+
+		if len(line) > maxLineLen {
+			_, _ = writer.Write(respInvalid)
+			_ = writer.Flush()
+			return
+		}
+
+		if bytes.Equal(line, []byte("PING")) {
+			_, _ = writer.Write(respPong)
+			_ = writer.Flush()
 			continue
 		}
 
@@ -162,30 +206,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 		}
 
-		if err := writer.Flush(); err != nil {
-			return
-		}
-	}
-}
-
-func readLineBounded(r *bufio.Reader, buf []byte) (int, error) {
-	var count int
-	for {
-		b, err := r.ReadByte()
-		if err != nil {
-			return 0, err
-		}
-		if b == '\n' {
-			if count > 0 && buf[count-1] == '\r' {
-				count--
+		if reader.Buffered() == 0 {
+			if err := writer.Flush(); err != nil {
+				return
 			}
-			return count, nil
 		}
-		if count >= len(buf) {
-			return 0, errors.New("line too long")
-		}
-		buf[count] = b
-		count++
 	}
 }
 
@@ -195,13 +220,7 @@ func parseIPToKey(raw string) (limiter.IPKey, bool) {
 		return limiter.IPKey{}, false
 	}
 
-	if addr.Is4() {
-		b := addr.As4()
-		ipNum := binary.BigEndian.Uint32(b[:])
-		return limiter.IPv4Key(ipNum), true
-	}
-
-	if addr.Is4In6() {
+	if addr.Is4() || addr.Is4In6() {
 		b := addr.As4()
 		ipNum := binary.BigEndian.Uint32(b[:])
 		return limiter.IPv4Key(ipNum), true

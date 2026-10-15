@@ -79,7 +79,7 @@ func TestEndToEndLoadAndCorrectness(t *testing.T) {
 	}
 
 	for i := 0; i < numClients; i++ {
-		clientIP := fmt.Sprintf("10.0.%d.%d", i/256, i%256)
+		clientIP := fmt.Sprintf("10.%d.%d.1", i/256, i%256)
 
 		time.Sleep(1 * time.Millisecond)
 
