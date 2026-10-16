@@ -13,18 +13,24 @@ func TestStorage_Allow_Basic(t *testing.T) {
 	key := IPv4Key(0x7f000001)
 
 	for i := 0; i < 5; i++ {
-		if !s.Allow(key, 5.0, 1.0) {
+		allowed, _ := s.Allow(key, 5.0, 1.0)
+		if !allowed {
 			t.Fatalf("request %d should be allowed within burst capacity", i+1)
 		}
 	}
 
-	if s.Allow(key, 5.0, 1.0) {
+	allowed, retryAfter := s.Allow(key, 5.0, 1.0)
+	if allowed {
 		t.Fatal("6th request must be rejected")
+	}
+	if retryAfter <= 0 {
+		t.Fatalf("expected positive retry-after, got %d", retryAfter)
 	}
 
 	time.Sleep(1050 * time.Millisecond)
 
-	if !s.Allow(key, 5.0, 1.0) {
+	allowed, _ = s.Allow(key, 5.0, 1.0)
+	if !allowed {
 		t.Fatal("request after 1 second refill must be allowed")
 	}
 }
@@ -44,17 +50,17 @@ func TestStorage_HardCap(t *testing.T) {
 		candidate++
 	}
 
-	if !s.Allow(collidingKeys[0], 5.0, 1.0) {
+	if ok, _ := s.Allow(collidingKeys[0], 5.0, 1.0); !ok {
 		t.Fatal("client 0 should be allowed")
 	}
 	time.Sleep(2 * time.Millisecond)
 
-	if !s.Allow(collidingKeys[1], 5.0, 1.0) {
+	if ok, _ := s.Allow(collidingKeys[1], 5.0, 1.0); !ok {
 		t.Fatal("client 1 should be allowed")
 	}
 	time.Sleep(2 * time.Millisecond)
 
-	if !s.Allow(collidingKeys[2], 5.0, 1.0) {
+	if ok, _ := s.Allow(collidingKeys[2], 5.0, 1.0); !ok {
 		t.Fatal("client 2 should be allowed by evicting the oldest idle entry")
 	}
 
@@ -98,13 +104,13 @@ func TestStorage_Validation(t *testing.T) {
 	s := NewStorage(1000)
 	key := IPv4Key(0x7f000001)
 
-	if s.Allow(key, math.NaN(), 1.0) {
+	if ok, _ := s.Allow(key, math.NaN(), 1.0); ok {
 		t.Fatal("NaN capacity must be rejected")
 	}
-	if s.Allow(key, 5.0, -1.0) {
+	if ok, _ := s.Allow(key, 5.0, -1.0); ok {
 		t.Fatal("negative refill rate must be rejected")
 	}
-	if s.Allow(key, 0.5, 1.0) {
+	if ok, _ := s.Allow(key, 0.5, 1.0); ok {
 		t.Fatal("capacity < 1.0 must be rejected")
 	}
 }

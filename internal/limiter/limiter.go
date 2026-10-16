@@ -21,22 +21,15 @@ type bucketData struct {
 type shard struct {
 	mu      sync.Mutex
 	buckets map[IPKey]bucketData
-	_       [48]byte
 }
 
 type Storage struct {
 	seed             uint64
 	maxEntryPerShard int
-	globalMu         sync.Mutex
-	globalTokens     float64
-	globalMax        float64
-	globalRefill     float64
-	globalLastUpdate int64
-	_                [8]byte
 	shards           [256]shard
 }
 
-func NewStorage(maxEntriesPerShard int, backendLimits ...float64) *Storage {
+func NewStorage(maxEntriesPerShard int) *Storage {
 	var seedBuf [8]byte
 	if _, err := cryptorand.Read(seedBuf[:]); err != nil {
 		binary.LittleEndian.PutUint64(seedBuf[:], uint64(time.Now().UnixNano()))
@@ -45,12 +38,6 @@ func NewStorage(maxEntriesPerShard int, backendLimits ...float64) *Storage {
 	s := &Storage{
 		seed:             binary.LittleEndian.Uint64(seedBuf[:]),
 		maxEntryPerShard: maxEntriesPerShard,
-	}
-
-	if len(backendLimits) >= 2 && backendLimits[0] > 0 && backendLimits[1] > 0 {
-		s.globalMax = backendLimits[0]
-		s.globalRefill = backendLimits[1]
-		s.globalTokens = backendLimits[0]
 	}
 
 	for i := 0; i < 256; i++ {
@@ -109,46 +96,20 @@ func (s *Storage) getShard(k IPKey) *shard {
 	return &s.shards[s.hashKey(k)]
 }
 
-func (s *Storage) allowGlobal(now int64) bool {
-	s.globalMu.Lock()
-	defer s.globalMu.Unlock()
-
-	delta := now - s.globalLastUpdate
-	if delta > 0 {
-		s.globalTokens += (float64(delta) / 1e9) * s.globalRefill
-		if s.globalTokens > s.globalMax {
-			s.globalTokens = s.globalMax
-		}
-		s.globalLastUpdate = now
-	}
-
-	if s.globalTokens >= 1.0 {
-		s.globalTokens -= 1.0
-		return true
-	}
-
-	return false
-}
-
-func (s *Storage) Allow(key IPKey, maxTokens float64, refillRate float64) bool {
+func (s *Storage) Allow(key IPKey, maxTokens, refillRate float64) (bool, int64) {
 	if maxTokens < 1.0 || refillRate <= 0 ||
 		math.IsNaN(maxTokens) || math.IsNaN(refillRate) ||
 		math.IsInf(maxTokens, 0) || math.IsInf(refillRate, 0) {
-		return false
+		return false, 0
 	}
 
 	now := time.Since(processStart).Nanoseconds()
-
 	sh := s.getShard(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
 	b, exists := sh.buckets[key]
 	if !exists {
-		if s.globalMax > 0 && !s.allowGlobal(now) {
-			return false
-		}
-
 		if s.maxEntryPerShard > 0 && len(sh.buckets) >= s.maxEntryPerShard {
 			var oldestKey IPKey
 			var oldestTime int64 = math.MaxInt64
@@ -171,7 +132,7 @@ func (s *Storage) Allow(key IPKey, maxTokens float64, refillRate float64) bool {
 			tokens:     maxTokens - 1.0,
 			lastUpdate: now,
 		}
-		return true
+		return true, 0
 	}
 
 	delta := now - b.lastUpdate
@@ -185,17 +146,14 @@ func (s *Storage) Allow(key IPKey, maxTokens float64, refillRate float64) bool {
 
 	if b.tokens < 1.0 {
 		sh.buckets[key] = b
-		return false
-	}
-
-	if s.globalMax > 0 && !s.allowGlobal(now) {
-		sh.buckets[key] = b
-		return false
+		missing := 1.0 - b.tokens
+		retryAfterMs := int64(math.Ceil((missing / refillRate) * 1000.0))
+		return false, retryAfterMs
 	}
 
 	b.tokens -= 1.0
 	sh.buckets[key] = b
-	return true
+	return true, 0
 }
 
 func (s *Storage) cleanShard(sh *shard, now, ttlNano int64) {
@@ -206,6 +164,10 @@ func (s *Storage) cleanShard(sh *shard, now, ttlNano int64) {
 		if (now - b.lastUpdate) >= ttlNano {
 			delete(sh.buckets, k)
 		}
+	}
+
+	if len(sh.buckets) == 0 {
+		sh.buckets = make(map[IPKey]bucketData)
 	}
 }
 

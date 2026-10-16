@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -18,60 +17,18 @@ import (
 	"github.com/Zapepta/api_rate-limiter/internal/server"
 )
 
-func isTerminal(f *os.File) bool {
-	stat, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return (stat.Mode() & os.ModeCharDevice) != 0
-}
-
 func main() {
-	configPath := flag.String("config", "rate-limiter.conf", "Path to config file")
-	testOnly := flag.Bool("t", false, "Test configuration validity and exit")
-	force := flag.Bool("force", false, "Force startup even with dangerous configuration warnings")
+	addr := flag.String("addr", ":8080", "TCP address (:8080) or UDS path (unix:///tmp/limiter.sock)")
+	burst := flag.Float64("burst", 5.0, "Allowed client burst capacity")
+	rps := flag.Float64("rps", 1.0, "Token refill rate per second")
+	capacity := flag.Int("cap", 1000, "Maximum entries per shard")
 	flag.Parse()
 
-	cfg, err := LoadConfig(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Config Load Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	warnings, err := cfg.Validate()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "\n[CONFIG REJECTED] %v\n\n", err)
-		os.Exit(1)
-	}
-
-	if len(warnings) > 0 {
-		for _, w := range warnings {
-			fmt.Fprintf(os.Stderr, "(!) %s\n", w)
-		}
-
-		if *force {
-			fmt.Println("Notice: Warnings overridden by -force flag. Continuing startup...")
-		} else if isTerminal(os.Stdin) {
-			fmt.Print("\nDangerous configuration detected. Do you want to proceed? [y/N]: ")
-			reader := bufio.NewReader(os.Stdin)
-			input, _ := reader.ReadString('\n')
-			input = strings.TrimSpace(strings.ToLower(input))
-
-			if input != "y" && input != "yes" {
-				fmt.Println("Startup aborted by user.")
-				os.Exit(1)
-			}
-			fmt.Println("Proceeding with startup...")
-		} else {
-			fmt.Fprintln(os.Stderr, "\n[FATAL] Cannot prompt for confirmation: non-interactive environment (no TTY).")
-			fmt.Fprintln(os.Stderr, "If you are sure about this config, add the '-force' flag to container args.")
-			os.Exit(1)
-		}
-	}
-
-	if *testOnly {
-		fmt.Println("Configuration OK.")
-		os.Exit(0)
+	network := "tcp"
+	listenAddr := *addr
+	if strings.HasPrefix(*addr, "unix://") || strings.HasSuffix(*addr, ".sock") || strings.HasPrefix(*addr, "/") || strings.HasPrefix(*addr, "./") {
+		network = "unix"
+		listenAddr = strings.TrimPrefix(*addr, "unix://")
 	}
 
 	runtime.GOMAXPROCS(1)
@@ -82,12 +39,12 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	storage := limiter.NewStorage(cfg.ShardCapacity, cfg.BackendBurst, cfg.BackendRPS)
+	storage := limiter.NewStorage(*capacity)
 	storage.StartCleaner(ctx, &wg, 30*time.Second)
 
-	srv := server.NewWithNetwork(cfg.Network, cfg.Addr, storage, cfg.ClientBurst, cfg.ClientRPS)
+	srv := server.NewWithNetwork(network, listenAddr, storage, *burst, *rps)
 
-	fmt.Println("\nSIDECAR RUNNING")
+	fmt.Printf("Rate limiter sidecar listening on [%s] %s (burst=%.1f, rps=%.1f)\n", network, listenAddr, *burst, *rps)
 	if err := srv.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Fatal error: %v\n", err)
 	}
