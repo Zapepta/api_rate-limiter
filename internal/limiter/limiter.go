@@ -19,25 +19,52 @@ type bucketData struct {
 }
 
 type shard struct {
-	mu      sync.Mutex
-	buckets map[IPKey]bucketData
+	mu          sync.Mutex
+	buckets     map[IPKey]bucketData
+	peakEntries int
+	evictions   int
+	_           [32]byte
 }
 
 type Storage struct {
 	seed             uint64
 	maxEntryPerShard int
+	maxTokens        float64
+	refillRate       float64
+	ttlNano          int64
 	shards           [256]shard
 }
 
-func NewStorage(maxEntriesPerShard int) *Storage {
+func NewStorage(maxEntriesPerShard int, maxTokens, refillRate float64) *Storage {
 	var seedBuf [8]byte
 	if _, err := cryptorand.Read(seedBuf[:]); err != nil {
 		binary.LittleEndian.PutUint64(seedBuf[:], uint64(time.Now().UnixNano()))
 	}
 
+	if math.IsNaN(maxTokens) || math.IsInf(maxTokens, 0) || maxTokens < 1.0 {
+		maxTokens = 1.0
+	}
+	if math.IsNaN(refillRate) || math.IsInf(refillRate, 0) || refillRate <= 0 {
+		refillRate = 1.0
+	}
+
+	const maxTTL = 24 * time.Hour
+	fullRefillSec := math.Ceil(maxTokens / refillRate)
+	if fullRefillSec > float64(maxTTL/time.Second) || fullRefillSec <= 0 {
+		fullRefillSec = float64(maxTTL / time.Second)
+	}
+
+	ttl := time.Duration(fullRefillSec) * time.Second
+	if ttl < 5*time.Second {
+		ttl = 5 * time.Second
+	}
+
 	s := &Storage{
 		seed:             binary.LittleEndian.Uint64(seedBuf[:]),
 		maxEntryPerShard: maxEntriesPerShard,
+		maxTokens:        maxTokens,
+		refillRate:       refillRate,
+		ttlNano:          ttl.Nanoseconds(),
 	}
 
 	for i := 0; i < 256; i++ {
@@ -96,14 +123,9 @@ func (s *Storage) getShard(k IPKey) *shard {
 	return &s.shards[s.hashKey(k)]
 }
 
-func (s *Storage) Allow(key IPKey, maxTokens, refillRate float64) (bool, int64) {
-	if maxTokens < 1.0 || refillRate <= 0 ||
-		math.IsNaN(maxTokens) || math.IsNaN(refillRate) ||
-		math.IsInf(maxTokens, 0) || math.IsInf(refillRate, 0) {
-		return false, 0
-	}
-
+func (s *Storage) Allow(key IPKey) (bool, int64) {
 	now := time.Since(processStart).Nanoseconds()
+
 	sh := s.getShard(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -111,35 +133,71 @@ func (s *Storage) Allow(key IPKey, maxTokens, refillRate float64) (bool, int64) 
 	b, exists := sh.buckets[key]
 	if !exists {
 		if s.maxEntryPerShard > 0 && len(sh.buckets) >= s.maxEntryPerShard {
-			var oldestKey IPKey
-			var oldestTime int64 = math.MaxInt64
+			var bestCandidateKey IPKey
+			var maxTokensFound float64 = -1.0
 			checked := 0
 
 			for k, candidate := range sh.buckets {
-				if candidate.lastUpdate < oldestTime {
-					oldestTime = candidate.lastUpdate
-					oldestKey = k
+				delta := now - candidate.lastUpdate
+				curTokens := candidate.tokens
+				if delta > 0 {
+					curTokens += (float64(delta) / 1e9) * s.refillRate
+					if curTokens > s.maxTokens {
+						curTokens = s.maxTokens
+					}
 				}
+
+				if curTokens >= s.maxTokens {
+					bestCandidateKey = k
+					break
+				}
+
+				if curTokens > maxTokensFound {
+					maxTokensFound = curTokens
+					bestCandidateKey = k
+				}
+
 				checked++
 				if checked >= 8 {
 					break
 				}
 			}
-			delete(sh.buckets, oldestKey)
+
+			delete(sh.buckets, bestCandidateKey)
+			sh.evictions++
+
+			evictLimit := s.maxEntryPerShard
+			if evictLimit < 128 {
+				evictLimit = 128
+			}
+
+			if sh.evictions >= evictLimit {
+				compacted := make(map[IPKey]bucketData, len(sh.buckets))
+				for k, v := range sh.buckets {
+					compacted[k] = v
+				}
+				sh.buckets = compacted
+				sh.evictions = 0
+				sh.peakEntries = len(sh.buckets)
+			}
 		}
 
 		sh.buckets[key] = bucketData{
-			tokens:     maxTokens - 1.0,
+			tokens:     s.maxTokens - 1.0,
 			lastUpdate: now,
+		}
+
+		if len(sh.buckets) > sh.peakEntries {
+			sh.peakEntries = len(sh.buckets)
 		}
 		return true, 0
 	}
 
 	delta := now - b.lastUpdate
 	if delta > 0 {
-		b.tokens += (float64(delta) / 1e9) * refillRate
-		if b.tokens > maxTokens {
-			b.tokens = maxTokens
+		b.tokens += (float64(delta) / 1e9) * s.refillRate
+		if b.tokens > s.maxTokens {
+			b.tokens = s.maxTokens
 		}
 		b.lastUpdate = now
 	}
@@ -147,7 +205,7 @@ func (s *Storage) Allow(key IPKey, maxTokens, refillRate float64) (bool, int64) 
 	if b.tokens < 1.0 {
 		sh.buckets[key] = b
 		missing := 1.0 - b.tokens
-		retryAfterMs := int64(math.Ceil((missing / refillRate) * 1000.0))
+		retryAfterMs := int64(math.Ceil((missing / s.refillRate) * 1000.0))
 		return false, retryAfterMs
 	}
 
@@ -156,22 +214,45 @@ func (s *Storage) Allow(key IPKey, maxTokens, refillRate float64) (bool, int64) 
 	return true, 0
 }
 
-func (s *Storage) cleanShard(sh *shard, now, ttlNano int64) {
+func (s *Storage) cleanShard(sh *shard, now int64) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
+	deleted := 0
 	for k, b := range sh.buckets {
-		if (now - b.lastUpdate) >= ttlNano {
+		if (now - b.lastUpdate) >= s.ttlNano {
 			delete(sh.buckets, k)
+			deleted++
 		}
 	}
 
+	if deleted == 0 {
+		return
+	}
+
+	threshold := s.maxEntryPerShard / 10
+	if threshold < 8 {
+		threshold = 8
+	}
+
 	if len(sh.buckets) == 0 {
-		sh.buckets = make(map[IPKey]bucketData)
+		if sh.peakEntries > 0 {
+			sh.buckets = make(map[IPKey]bucketData)
+			sh.peakEntries = 0
+			sh.evictions = 0
+		}
+	} else if sh.peakEntries >= threshold*2 && len(sh.buckets) < threshold {
+		compacted := make(map[IPKey]bucketData, len(sh.buckets))
+		for k, v := range sh.buckets {
+			compacted[k] = v
+		}
+		sh.buckets = compacted
+		sh.peakEntries = len(sh.buckets)
+		sh.evictions = 0
 	}
 }
 
-func (s *Storage) StartCleaner(ctx context.Context, wg *sync.WaitGroup, ttl time.Duration) {
+func (s *Storage) StartCleaner(ctx context.Context, wg *sync.WaitGroup) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -179,7 +260,6 @@ func (s *Storage) StartCleaner(ctx context.Context, wg *sync.WaitGroup, ttl time
 		defer ticker.Stop()
 
 		var currentShard int
-		ttlNano := ttl.Nanoseconds()
 
 		for {
 			select {
@@ -187,7 +267,7 @@ func (s *Storage) StartCleaner(ctx context.Context, wg *sync.WaitGroup, ttl time
 				return
 			case <-ticker.C:
 				now := time.Since(processStart).Nanoseconds()
-				s.cleanShard(&s.shards[currentShard], now, ttlNano)
+				s.cleanShard(&s.shards[currentShard], now)
 				currentShard = (currentShard + 1) % 256
 			}
 		}

@@ -30,8 +30,8 @@ func TestEndToEndLoadAndCorrectness(t *testing.T) {
 	serverAddr := tmpListener.Addr().String()
 	_ = tmpListener.Close()
 
-	storage := limiter.NewStorage(2000)
-	srv := server.New(serverAddr, storage, maxTokens, refillRate)
+	storage := limiter.NewStorage(2000, maxTokens, refillRate)
+	srv := server.New(serverAddr, storage)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

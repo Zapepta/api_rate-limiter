@@ -35,50 +35,40 @@ const (
 )
 
 type Limiter interface {
-	Allow(key limiter.IPKey, maxTokens, refillRate float64) (bool, int64)
+	Allow(key limiter.IPKey) (bool, int64)
 }
 
 type Metrics struct {
 	Allowed  uint64
 	Rejected uint64
 	Invalid  uint64
+	Dropped  uint64
 }
 
 type Server struct {
-	network    string
-	addr       string
-	limiter    Limiter
-	maxTokens  float64
-	refillRate float64
-	conns      sync.Map
-	sem        chan struct{}
-	metrics    Metrics
+	network string
+	addr    string
+	limiter Limiter
+	conns   sync.Map
+	sem     chan struct{}
+	metrics Metrics
 }
 
-func New(addr string, limiter Limiter, limits ...float64) *Server {
+func New(addr string, limiter Limiter) *Server {
 	netType := "tcp"
 	if strings.HasPrefix(addr, "unix://") || strings.HasSuffix(addr, ".sock") || strings.HasPrefix(addr, "/") || strings.HasPrefix(addr, "./") {
 		netType = "unix"
 		addr = strings.TrimPrefix(addr, "unix://")
 	}
-	return NewWithNetwork(netType, addr, limiter, limits...)
+	return NewWithNetwork(netType, addr, limiter)
 }
 
-func NewWithNetwork(network, addr string, limiter Limiter, limits ...float64) *Server {
-	maxTok := 5.0
-	refill := 1.0
-	if len(limits) >= 2 && limits[0] > 0 && limits[1] > 0 {
-		maxTok = limits[0]
-		refill = limits[1]
-	}
-
+func NewWithNetwork(network, addr string, limiter Limiter) *Server {
 	return &Server{
-		network:    network,
-		addr:       addr,
-		limiter:    limiter,
-		maxTokens:  maxTok,
-		refillRate: refill,
-		sem:        make(chan struct{}, maxConnections),
+		network: network,
+		addr:    addr,
+		limiter: limiter,
+		sem:     make(chan struct{}, maxConnections),
 	}
 }
 
@@ -127,13 +117,12 @@ func (s *Server) Run(ctx context.Context) error {
 			continue
 		}
 
-		if s.network == "tcp" {
-			select {
-			case s.sem <- struct{}{}:
-			case <-time.After(50 * time.Millisecond):
-				_ = conn.Close()
-				continue
-			}
+		select {
+		case s.sem <- struct{}{}:
+		default:
+			atomic.AddUint64(&s.metrics.Dropped, 1)
+			_ = conn.Close()
+			continue
 		}
 
 		s.conns.Store(conn, struct{}{})
@@ -143,9 +132,7 @@ func (s *Server) Run(ctx context.Context) error {
 			defer func() {
 				s.conns.Delete(c)
 				_ = c.Close()
-				if s.network == "tcp" {
-					<-s.sem
-				}
+				<-s.sem
 				wg.Done()
 			}()
 			s.handleConnection(c)
@@ -162,6 +149,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(idleTimeout))
 
 	var numBuf [20]byte
+	var statsBuf [160]byte
 
 	for {
 		if reader.Buffered() == 0 {
@@ -180,9 +168,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 		if len(line) > maxLineLen {
 			atomic.AddUint64(&s.metrics.Invalid, 1)
-			_, _ = writer.Write(respInvalid)
-			_ = writer.Flush()
-			return
+			if _, err := writer.Write(respInvalid); err != nil {
+				return
+			}
+			if reader.Buffered() == 0 {
+				_ = writer.Flush()
+			}
+			continue
 		}
 
 		if bytes.Equal(line, []byte("PING")) {
@@ -192,12 +184,16 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 
 		if bytes.Equal(line, []byte("STATS")) {
-			stats := fmt.Sprintf("+OK allowed=%d rejected=%d invalid=%d\r\n",
-				atomic.LoadUint64(&s.metrics.Allowed),
-				atomic.LoadUint64(&s.metrics.Rejected),
-				atomic.LoadUint64(&s.metrics.Invalid),
-			)
-			_, _ = writer.Write([]byte(stats))
+			b := append(statsBuf[:0], "+OK allowed="...)
+			b = strconv.AppendUint(b, atomic.LoadUint64(&s.metrics.Allowed), 10)
+			b = append(b, " rejected="...)
+			b = strconv.AppendUint(b, atomic.LoadUint64(&s.metrics.Rejected), 10)
+			b = append(b, " invalid="...)
+			b = strconv.AppendUint(b, atomic.LoadUint64(&s.metrics.Invalid), 10)
+			b = append(b, " dropped="...)
+			b = strconv.AppendUint(b, atomic.LoadUint64(&s.metrics.Dropped), 10)
+			b = append(b, "\r\n"...)
+			_, _ = writer.Write(b)
 			_ = writer.Flush()
 			continue
 		}
@@ -210,7 +206,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 				return
 			}
 		} else {
-			allowed, retryAfterMs := s.limiter.Allow(key, s.maxTokens, s.refillRate)
+			allowed, retryAfterMs := s.limiter.Allow(key)
 			if allowed {
 				atomic.AddUint64(&s.metrics.Allowed, 1)
 				if _, err := writer.Write(respOK); err != nil {

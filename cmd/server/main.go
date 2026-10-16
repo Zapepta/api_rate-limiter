@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/Zapepta/api_rate-limiter/internal/limiter"
 	"github.com/Zapepta/api_rate-limiter/internal/server"
@@ -31,18 +29,19 @@ func main() {
 		listenAddr = strings.TrimPrefix(*addr, "unix://")
 	}
 
-	runtime.GOMAXPROCS(1)
-	debug.SetMemoryLimit(24 * 1024 * 1024)
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(24 * 1024 * 1024)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	var wg sync.WaitGroup
 
-	storage := limiter.NewStorage(*capacity)
-	storage.StartCleaner(ctx, &wg, 30*time.Second)
+	storage := limiter.NewStorage(*capacity, *burst, *rps)
+	storage.StartCleaner(ctx, &wg)
 
-	srv := server.NewWithNetwork(network, listenAddr, storage, *burst, *rps)
+	srv := server.NewWithNetwork(network, listenAddr, storage)
 
 	fmt.Printf("Rate limiter sidecar listening on [%s] %s (burst=%.1f, rps=%.1f)\n", network, listenAddr, *burst, *rps)
 	if err := srv.Run(ctx); err != nil {

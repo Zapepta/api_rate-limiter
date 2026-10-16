@@ -9,17 +9,17 @@ import (
 )
 
 func TestStorage_Allow_Basic(t *testing.T) {
-	s := NewStorage(1000)
+	s := NewStorage(1000, 5.0, 1.0)
 	key := IPv4Key(0x7f000001)
 
 	for i := 0; i < 5; i++ {
-		allowed, _ := s.Allow(key, 5.0, 1.0)
+		allowed, _ := s.Allow(key)
 		if !allowed {
 			t.Fatalf("request %d should be allowed within burst capacity", i+1)
 		}
 	}
 
-	allowed, retryAfter := s.Allow(key, 5.0, 1.0)
+	allowed, retryAfter := s.Allow(key)
 	if allowed {
 		t.Fatal("6th request must be rejected")
 	}
@@ -29,14 +29,14 @@ func TestStorage_Allow_Basic(t *testing.T) {
 
 	time.Sleep(1050 * time.Millisecond)
 
-	allowed, _ = s.Allow(key, 5.0, 1.0)
+	allowed, _ = s.Allow(key)
 	if !allowed {
 		t.Fatal("request after 1 second refill must be allowed")
 	}
 }
 
 func TestStorage_HardCap(t *testing.T) {
-	s := NewStorage(2)
+	s := NewStorage(2, 5.0, 1.0)
 
 	var collidingKeys []IPKey
 	targetShard := s.hashKey(IPv4Key(1))
@@ -50,18 +50,18 @@ func TestStorage_HardCap(t *testing.T) {
 		candidate++
 	}
 
-	if ok, _ := s.Allow(collidingKeys[0], 5.0, 1.0); !ok {
+	if ok, _ := s.Allow(collidingKeys[0]); !ok {
 		t.Fatal("client 0 should be allowed")
 	}
 	time.Sleep(2 * time.Millisecond)
 
-	if ok, _ := s.Allow(collidingKeys[1], 5.0, 1.0); !ok {
+	if ok, _ := s.Allow(collidingKeys[1]); !ok {
 		t.Fatal("client 1 should be allowed")
 	}
 	time.Sleep(2 * time.Millisecond)
 
-	if ok, _ := s.Allow(collidingKeys[2], 5.0, 1.0); !ok {
-		t.Fatal("client 2 should be allowed by evicting the oldest idle entry")
+	if ok, _ := s.Allow(collidingKeys[2]); !ok {
+		t.Fatal("client 2 should be allowed")
 	}
 
 	sh := s.getShard(collidingKeys[0])
@@ -75,7 +75,7 @@ func TestStorage_HardCap(t *testing.T) {
 		t.Fatalf("shard capacity exceeded: got %d, max 2", currentCount)
 	}
 	if client0Exists {
-		t.Fatal("client 0 was the oldest and must have been evicted")
+		t.Fatal("client 0 had more refilled tokens and must have been evicted losslessly")
 	}
 	if !client2Exists {
 		t.Fatal("client 2 is the new client and must be present in the shard")
@@ -100,23 +100,20 @@ func TestStorage_MaskIPv6to64(t *testing.T) {
 	}
 }
 
-func TestStorage_Validation(t *testing.T) {
-	s := NewStorage(1000)
-	key := IPv4Key(0x7f000001)
+func TestStorage_Validation_NaN_Inf(t *testing.T) {
+	s := NewStorage(1000, math.NaN(), math.NaN())
+	if s.maxTokens != 1.0 || s.refillRate != 1.0 {
+		t.Fatalf("NaN parameters must be sanitized to 1.0, got maxTokens=%.2f refillRate=%.2f", s.maxTokens, s.refillRate)
+	}
 
-	if ok, _ := s.Allow(key, math.NaN(), 1.0); ok {
-		t.Fatal("NaN capacity must be rejected")
-	}
-	if ok, _ := s.Allow(key, 5.0, -1.0); ok {
-		t.Fatal("negative refill rate must be rejected")
-	}
-	if ok, _ := s.Allow(key, 0.5, 1.0); ok {
-		t.Fatal("capacity < 1.0 must be rejected")
+	sInf := NewStorage(1000, math.Inf(1), math.Inf(-1))
+	if sInf.maxTokens != 1.0 || sInf.refillRate != 1.0 {
+		t.Fatalf("Inf parameters must be sanitized to 1.0, got maxTokens=%.2f refillRate=%.2f", sInf.maxTokens, sInf.refillRate)
 	}
 }
 
 func BenchmarkStorage_Warm_Allowed(b *testing.B) {
-	s := NewStorage(1000)
+	s := NewStorage(1000, 100000.0, 10000.0)
 	const numClients = 10000
 	keys := make([]IPKey, numClients)
 
@@ -124,7 +121,7 @@ func BenchmarkStorage_Warm_Allowed(b *testing.B) {
 		var buf [16]byte
 		binary.BigEndian.PutUint64(buf[:8], uint64(i))
 		keys[i] = IPv6Key(buf)
-		s.Allow(keys[i], 100000.0, 10000.0)
+		s.Allow(keys[i])
 	}
 
 	b.ResetTimer()
@@ -134,14 +131,14 @@ func BenchmarkStorage_Warm_Allowed(b *testing.B) {
 		var idx int
 		for pb.Next() {
 			k := keys[idx%numClients]
-			s.Allow(k, 100000.0, 10000.0)
+			s.Allow(k)
 			idx++
 		}
 	})
 }
 
 func BenchmarkStorage_Warm_Rejected(b *testing.B) {
-	s := NewStorage(1000)
+	s := NewStorage(1000, 5.0, 0.001)
 	const numClients = 10000
 	keys := make([]IPKey, numClients)
 
@@ -150,7 +147,7 @@ func BenchmarkStorage_Warm_Rejected(b *testing.B) {
 		binary.BigEndian.PutUint64(buf[:8], uint64(i))
 		keys[i] = IPv6Key(buf)
 		for j := 0; j < 5; j++ {
-			s.Allow(keys[i], 5.0, 0.001)
+			s.Allow(keys[i])
 		}
 	}
 
@@ -161,14 +158,14 @@ func BenchmarkStorage_Warm_Rejected(b *testing.B) {
 		var idx int
 		for pb.Next() {
 			k := keys[idx%numClients]
-			s.Allow(k, 5.0, 0.001)
+			s.Allow(k)
 			idx++
 		}
 	})
 }
 
 func BenchmarkStorage_Cold_Insert(b *testing.B) {
-	s := NewStorage(1000000)
+	s := NewStorage(1000000, 5.0, 1.0)
 	b.ResetTimer()
 	b.ReportAllocs()
 
@@ -185,18 +182,18 @@ func BenchmarkStorage_Cold_Insert(b *testing.B) {
 			binary.BigEndian.PutUint64(buf[8:], id)
 			key := IPv6Key(buf)
 
-			s.Allow(key, 5.0, 1.0)
+			s.Allow(key)
 		}
 	})
 }
 
 func BenchmarkStorage_Saturated_Eviction(b *testing.B) {
-	s := NewStorage(1000)
+	s := NewStorage(1000, 5.0, 100.0)
 
 	for i := 0; i < 256000; i++ {
 		var buf [16]byte
 		binary.BigEndian.PutUint64(buf[8:], uint64(i))
-		s.Allow(IPv6Key(buf), 5.0, 100.0)
+		s.Allow(IPv6Key(buf))
 	}
 
 	b.ResetTimer()
@@ -215,7 +212,7 @@ func BenchmarkStorage_Saturated_Eviction(b *testing.B) {
 			binary.BigEndian.PutUint64(buf[8:], id)
 			key := IPv6Key(buf)
 
-			s.Allow(key, 5.0, 100.0)
+			s.Allow(key)
 		}
 	})
 }
