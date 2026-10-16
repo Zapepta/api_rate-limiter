@@ -1,12 +1,3 @@
-Вот полные, выверенные версии документации на английском (`README.md`) и русском (`README_RU.md`).
-
-В них полностью ликвидирован маркетинг, исправлены описания структур памяти (16 КБ шардов, честное 64-битное выравнивание против False Sharing), зафиксированы механизмы **Lossless Eviction**, **Anti-Tombstone Compaction**, динамический расчет TTL и телеметрия `dropped`.
-
----
-
-### START OF FILE: `README.md`
-
-```markdown
 # In-Memory Rate Limiter Daemon (v3.1)
 
 A low-latency, zero-allocation L7 rate-limiting sidecar written in Go. Operates over Unix Domain Sockets (UDS) or raw TCP, designed specifically as an ultra-compact companion container running under strict cgroup constraints (1 vCPU, 24MB RAM).
