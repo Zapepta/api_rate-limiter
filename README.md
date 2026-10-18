@@ -1,125 +1,161 @@
-# In-Memory TCP Rate Limiter
+# In-Memory Rate Limiter Daemon (v3.1)
 
 [English](README.md) | [Русский](README_RU.md)
 
-A high-throughput, zero-allocation L7 rate limiting daemon written in Go over raw TCP. Designed to operate as a lightweight decision engine under strictly constrained container environments (e.g., 1 vCPU, 30MB RAM cgroup limit).
-
-## Architectural Trade-offs & Mechanics
-
-This project was built as an R&D exercise to explore the limits of the Go runtime, memory management, and network stack under extreme constraints.
-
-### 1. Zero-GC Memory Layout
-To survive within a 30MB memory limit under high connection churn, the storage engine avoids the Go Garbage Collector entirely.
-State is stored in a `map[IPKey]bucketData` where `IPKey` is a flat `[16]byte` array and `bucketData` contains only scalar values. Since there are zero pointers, the Go compiler sets `haspointers=false`, completely bypassing GC scanning for the storage map. This guarantees **0 allocs/op** on the hot path.
-
-### 2. High-Cardinality Subnet Collapse (Graceful Degradation)
-A pure per-IP rate limiter is mathematically blind to distributed high-cardinality traffic (e.g., a botnet where 100,000 IPs send 1 request each). To prevent memory exhaustion and cache churn (evicting legitimate users to make room for one-off bots), the system employs dynamic subnet masking:
-* **Normal State:** Limits are tracked per `/32` (individual IPv4).
-* **Overloaded State:** When a shard reaches 90% capacity, IPv4 tracking dynamically collapses to a `/24` subnet (`lookupKey[15] = 0`).
-* **Trade-off:** Attackers from the same proxy pool/datacenter are grouped into a single bucket and throttled instantly. Legitimate users sharing a CGNAT within an attacked `/24` subnet will experience temporary degradation (Limp Mode) to ensure the backend database survives the spike.
-
-### 3. Shard Dispersion Alignment
-The storage is divided into 256 shards using an FNV-1a hash to minimize mutex contention. To ensure the `/24` subnet collapse works correctly, the hashing algorithm ignores the 15th byte for IPv4 addresses. This guarantees that all 256 IPs of a `/24` subnet fall into the exact same mutex shard.
-
-### 4. Behavioral UX & Burst Throttling
-Under saturation, the burst capacity (`maxTokens`) is strictly reduced to 1.0.
-* **Smart Clients** (implementing UI debounce or respecting `Retry-After`) maintain a high success rate.
-* **Rage Clickers** (spamming requests on error) burn their tokens instantly and self-DoS, resulting in heavy throttling.
+A low-latency, zero-allocation L7 rate-limiting sidecar written in Go. Operates over Unix Domain Sockets (UDS) or raw TCP, designed specifically as an ultra-compact companion container running under strict cgroup constraints (1 vCPU, 24MB RAM).
 
 ---
 
-## Verified Benchmarks
+## Architectural Evolution
 
-> **Note on performance reproducibility:** Absolute throughput numbers (ns/op and req/s) will naturally vary depending on CPU architecture, clock speeds, and OS scheduling (tested on 13th Gen Intel Core i3-13100F, Windows amd64). The critical architectural property of this system is **0 allocs/op on the steady-state hot path**. This eliminates heap fragmentation and prevents GC-induced latency spikes regardless of the underlying hardware or container limits.
+```
++---------------------------------------------------------------------------------------------------+
+| v1: The Naive Prototype                                                                           |
+| * map[string]*bucket + 256 unaligned shards.                                                      |
+| * Fatal Flaw: "0 allocs/op" claim was an artifact of pre-warmed benchmarks. Real TCP networking   |
+|   allocated on every request. Hardcoded limits.                                                   |
++---------------------------------------------------------------------------------------------------+
+│
+▼
++---------------------------------------------------------------------------------------------------+
+| v2: The Over-Engineered Pseudo-WAF                                                                |
+| * Zero-GC scalar storage (map[IPKey]bucketData, haspointers=false).                              |
+| * Fatal Flaw: Broken Layer Boundaries. Attempted L7 anti-DDoS via dynamic /24 subnet bans,       |
+|   causing collateral damage to innocent NAT/CGNAT users.                                          |
++---------------------------------------------------------------------------------------------------+
+│
+▼
++---------------------------------------------------------------------------------------------------+
+| v3.1: The Production-Grade Sidecar (Current)                                                      |
+| * Mathematical Boundaries Restored: Pure, deterministic turnstile & pre-filter.                   |
+| * Hardware Cache-Line Alignment: 64-byte padded shards eliminate multi-core False Sharing.       |
+| * Lossless Eviction Policy: Prioritizes fully refilled buckets, eliminating eviction amnesty.     |
+| * Tombstone & Fragmentation Defense: Amortized compaction prevents Go hmap memory bloat.          |
+| * Dynamic Lifecycle: Shard TTL derived directly from bucket refill physics (burst / rps).        |
+| * 12-Factor Design: CLI/Env-driven runtime with zero config-file dependencies.                    |
++---------------------------------------------------------------------------------------------------+
+```
 
-**What these benchmarks prove:**
-These tests are not here to chase raw nanoseconds. They are designed to validate specific architectural invariants:
-1. **Warm Path (`Allowed`/`Rejected`):** Proves the `0 allocs/op` claim. Once a client is in the map, updating their token bucket costs zero heap memory, ensuring the Garbage Collector stays dormant.
-2. **Cold Path (`Insert`):** Shows the expected baseline cost and allocations when the Go map expands to accommodate new IP addresses.
-3. **Saturated Path (`Eviction`):** Proves that the O(1) Sampled LRU and `/24` subnet collapse mechanisms add negligible overhead (just ~50ns) and do not degrade system throughput during a high-cardinality attack.
+### Architectural Decisions & Corrections
+1. **False Sharing Protection:** Each shard header is explicitly padded to 64 bytes (`_ [32]byte`). The 256-shard array occupies 16 KB. This eliminates cross-core L1/L2 cache-line invalidation when scaled across multiple CPU cores without forcing single-thread bottlenecks.
+2. **Lossless Eviction (Anti-Amnesty):** Standard LRU eviction in rate limiters creates a vulnerability: aggressive clients flush the cache with spoofed keys, evicting penalized buckets and restoring full tokens upon re-entry. v3.1 samples candidates and prioritizes keys that have already reached or approached full refill ($curTokens \ge maxTokens$).
+3. **Map Tombstone Compaction:** Go hash maps (`runtime/map.go`) never shrink backing bucket arrays after `delete()`. Rapid `delete` $\to$ `insert` churn in full shards creates chains of overflow buckets. Shards track cumulative evictions and compact into a fresh map once evictions exceed the shard limit ($\ge 128$).
+4. **Dynamic TTL Alignment:** Background cleanup intervals are bound to the refill characteristics of the configured limits:
+   $$\text{TTL} = \max\left(5\text{s}, \min\left(24\text{h}, \left\lceil \frac{\text{maxTokens}}{\text{refillRate}} \right\rceil \text{s}\right)\right)$$
+   This prevents premature deletion of penalized clients under low refill rates.
 
-### 1. Core Engine (Zero-Alloc Hot Path)
+---
+
+## Core Engine Architecture
+
+### 1. Deterministic Backpressure (`Retry-After`)
+Instead of emitting generic rejections that trigger aggressive retry storms, the engine calculates the exact millisecond delay required to refill tokens to a valid state:
+$$\text{waitMs} = \left\lceil \frac{1.0 - \text{tokens}}{\text{refillRate}} \times 1000 \right\rceil$$
+The daemon responds with `-ERR <waitMs>\r\n`. Reverse proxies (Envoy/Nginx) map this directly to RFC-compliant `Retry-After: <sec>` headers.
+
+### 2. Zero-GC Memory Layout
+State is stored in 256 sharded hash maps: `map[IPKey]bucketData`.
+* `IPKey` is a scalar `[16]byte` (IPv4 is mapped via `::ffff:a.b.c.d`).
+* `bucketData` consists entirely of scalar primitives (`float64`, `int64`).
+Because neither type contains pointers, the Go runtime marks underlying map buckets with `haspointers=false`. The Garbage Collector completely skips scanning storage entries during GC mark phases, eliminating latency spikes.
+
+### 3. Shard Memory Layout
+```go
+type shard struct {
+    mu          sync.Mutex           // 8 bytes
+    buckets     map[IPKey]bucketData // 8 bytes (pointer to hmap)
+    peakEntries int                  // 8 bytes
+    evictions   int                  // 8 bytes
+    _           [32]byte             // 32-byte cache-line padding
+}
+```
+Each shard occupies exactly 64 bytes (the standard L1/L2 cache line size for x86-64 and ARM64). The top-level shard array occupies exactly **16,384 bytes (16 KB)**, while entry payload data lives in the GC-exempt heap.
+
+### 4. Network Pipelining & Concurrency Control
+* **UDS & TCP Support:** Binds to Unix Domain Sockets (`unix:///tmp/limiter.sock`) or TCP (`:8080`).
+* **Non-Blocking Connection Pool:** Enforces a hard limit of 256 concurrent connections. Saturated connection attempts are immediately dropped via non-blocking rejection, incrementing the `dropped` telemetry metric without blocking the accept loop.
+* **Opportunistic Batch Flushing:** Flushes the write buffer only when the incoming socket read buffer is empty (`reader.Buffered() == 0`), coalescing pipelined responses into minimal `write(2)` syscalls.
+* **Zero-Allocation Observability:** The `STATS` command uses pre-allocated stack buffers and `strconv.AppendUint` to produce metrics with zero heap allocations.
+
+---
+
+## Benchmarks & Verification
+
+> Measured on: 13th Gen Intel(R) Core(TM) i3-13100F (amd64), Go 1.25+.
+
+### In-Memory Engine Microbenchmarks
+```bash
+go test -run=^$ -bench="." -benchmem ./internal/limiter
+```
 ```text
-BenchmarkStorage_Warm_Allowed-8        58141887    19.21 ns/op      0 B/op    0 allocs/op
-BenchmarkStorage_Warm_Rejected-8       58560008    18.87 ns/op      0 B/op    0 allocs/op
-BenchmarkStorage_Cold_Insert-8         20070379    59.66 ns/op    133 B/op    0 allocs/op
-BenchmarkStorage_Saturated_Eviction-8  21036687    72.08 ns/op      3 B/op    0 allocs/op
+BenchmarkStorage_Warm_Allowed-8         49349409        21.15 ns/op        0 B/op    0 allocs/op
+BenchmarkStorage_Warm_Rejected-8        50765071        21.05 ns/op        0 B/op    0 allocs/op
+BenchmarkStorage_Cold_Insert-8          17771379        64.80 ns/op      151 B/op    0 allocs/op
+BenchmarkStorage_Saturated_Eviction-8   15842100        94.20 ns/op        0 B/op    0 allocs/op
 ```
-
-### 2. Network Throughput
-* **In-Process Integration (`load_test.go`):** 131,088 req/s (1000 allowed, 9000 rejected, 0 errors).
-* **Out-of-Process Daemon (`cmd/stress`):** 53,663 req/s over raw TCP loopback.
-
-### 3. Behavioral Simulation (`cmd/simulator`)
-Simulating 50 concurrent botnet streams vs 3 psychological profiles of real users over 15 seconds:
-```text
---- BOTNET SUMMARY ---
-Total Requests:  942789
-Allowed (+OK):   939533
-Blocked (-ERR):  3256
-Throughput:      62852.60 req/s
-
---- CLIENT PROFILES EVALUATION ---
-Profile                        | Client IP       | Sent  | +OK   | -ERR  | Success | Status    
------------------------------------------------------------------------------------------
-Smart Client (Debounce 1.1s)   | 95.24.12.10     | 16    | 12    | 4     |  75.0%  | OPTIMAL   
-Smart Client (Debounce 1.1s)   | 178.62.204.55   | 16    | 13    | 3     |  81.2%  | OPTIMAL   
-Rage Clicker (Spam on error)   | 213.87.161.8    | 44    | 15    | 29    |  34.1%  | THROTTLED 
-Slow Reader (Think Time 3-5s)  | 188.162.4.90    | 4     | 4     | 0     | 100.0%  | OPTIMAL   
-```
+* **Hot Path:** ~21 ns per check with **0 B/op and 0 allocs/op**.
+* **Cold Insert:** Memory allocation strictly isolated to initial hash map bucket growth.
+* **Saturated Eviction:** Sustained churn executes in ~94 ns with zero allocations in steady state; periodic compaction overhead is amortized across thousands of requests.
 
 ---
 
-## Known Limitations & Trade-offs
+## Known Trade-offs & Operational Boundaries
 
-To achieve extreme performance within a 30MB memory footprint, several deliberate architectural sacrifices were made:
-
-1. **Collateral Damage (CGNAT):** The `/24` subnet collapse effectively neutralizes proxy-pool botnets, but it will temporarily throttle legitimate users sharing the same CGNAT (e.g., mobile carriers, corporate networks) as the attacker.
-2. **Ephemeral State:** The storage is strictly in-memory. Container restarts or deployments will wipe all rate-limit history, granting a temporary amnesty to previously throttled clients.
-3. **Non-Standard Protocol:** To minimize allocation overhead, the daemon uses a custom raw TCP text protocol (`+OK` / `-ERR`). It cannot be plugged directly into Envoy or Nginx without custom glue code (e.g., Lua or WASM), as it lacks native gRPC (Envoy RLS) or RESP (Redis) support.
-4. **Zero Observability:** Designed as a raw performance prototype, it currently lacks Prometheus metrics, health checks, or structured logging, making it a "black box" in a real production environment.
-5. **L7 Blindness:** The engine operates solely on IP addresses. It cannot rate-limit based on HTTP headers, JWT claims, or API keys without the upstream gateway parsing and forwarding them as raw strings.
+1. **Node-Local State:** State resides purely in memory. Container restarts reset quotas. This daemon acts as a high-throughput ingress shield, not a distributed transactional database (e.g., Redis).
+2. **IPv6 `/64` Masking:** Native IPv6 addresses are masked to `/64` subnets (except loopback `::1`) to prevent bucket exhaustion via IPv6 SLAAC privacy extension address hopping.
+3. **L7 Protocol Agnosticism:** The daemon evaluates raw IP keys. Extracting client IPs from `X-Forwarded-For` or tokens from JWTs must be performed by the upstream proxy (Envoy, Nginx, Traefik).
 
 ---
 
-## Project Structure
+## Configuration & Usage
+
+Configured entirely via CLI flags (12-Factor App design):
 
 ```text
-cmd/
-  server/       - Main daemon entrypoint
-  stress/       - Out-of-process throughput benchmark
-  simulator/    - Behavioral UX and traffic simulation
-internal/
-  limiter/      - Zero-GC storage, FNV-1a hashing, subnet collapse logic
-  server/       - Hardened TCP server, micro-buffers, deadlock prevention
-load_test.go    - Autonomous E2E integration test suite
+Usage of rate-limiter:
+  -addr string
+        TCP bind address (:8080) or UDS path (unix:///tmp/limiter.sock) (default ":8080")
+  -burst float
+        Allowed client burst capacity (default 5.0)
+  -rps float
+        Token refill rate per second (default 1.0)
+  -cap int
+        Maximum entries per shard before eviction (default 1000)
 ```
 
----
+### Quick Start
 
-## Running & Testing
-
-**Start the server:**
+#### Run over TCP
 ```bash
-go run ./cmd/server
+go run ./cmd/server -addr :8080 -burst 10 -rps 2
 ```
 
-**Run autonomous E2E integration test:**
+#### Run over Unix Domain Socket (Recommended for Sidecars)
 ```bash
-go test -v .\load_test.go
+go run ./cmd/server -addr unix:///tmp/limiter.sock -burst 20 -rps 5
 ```
 
-**Run core benchmarks:**
+#### Protocol Interaction
 ```bash
-go test -bench="." -benchmem .\internal\limiter
+# Liveness Probe
+echo "PING" | nc 127.0.0.1 8080
+# Output: +PONG
+
+# Rate-limit evaluation
+echo "192.168.1.1" | nc 127.0.0.1 8080
+# Output on success: +OK
+# Output on rate limit: -ERR 450 (wait 450ms)
+
+# Lock-Free Telemetry
+echo "STATS" | nc 127.0.0.1 8080
+# Output: +OK allowed=1000 rejected=9000 invalid=0 dropped=0
 ```
 
-**Run out-of-process stress test:**
+### Running Tests
 ```bash
-go run ./cmd/stress -c 200 -r 50
-```
+# Unit, safety, and integration tests
+go test -v ./...
 
-**Run behavioral traffic simulation:**
-```bash
-go run ./cmd/simulator
+# Core engine microbenchmarks
+go test -run=^$ -bench="." -benchmem ./internal/limiter
 ```

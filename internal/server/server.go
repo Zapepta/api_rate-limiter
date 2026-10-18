@@ -9,7 +9,11 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -18,8 +22,10 @@ import (
 
 var (
 	respOK      = []byte("+OK\r\n")
-	respErr     = []byte("-ERR Rate limit exceeded\r\n")
 	respInvalid = []byte("-ERR Invalid IP address\r\n")
+	respPong    = []byte("+PONG\r\n")
+	respErrPref = []byte("-ERR ")
+	crlf        = []byte("\r\n")
 )
 
 const (
@@ -29,50 +35,71 @@ const (
 )
 
 type Limiter interface {
-	Allow(key limiter.IPKey, maxTokens, refillRate float64) bool
+	Allow(key limiter.IPKey) (bool, int64)
+}
+
+type Metrics struct {
+	Allowed  uint64
+	Rejected uint64
+	Invalid  uint64
+	Dropped  uint64
 }
 
 type Server struct {
-	addr       string
-	limiter    Limiter
-	maxTokens  float64
-	refillRate float64
-	conns      sync.Map
-	sem        chan struct{}
+	network string
+	addr    string
+	limiter Limiter
+	conns   sync.Map
+	sem     chan struct{}
+	metrics Metrics
 }
 
-func New(addr string, limiter Limiter, limits ...float64) *Server {
-	maxTok := 5.0
-	refill := 1.0
-	if len(limits) >= 2 && limits[0] > 0 && limits[1] > 0 {
-		maxTok = limits[0]
-		refill = limits[1]
+func New(addr string, limiter Limiter) *Server {
+	netType := "tcp"
+	if strings.HasPrefix(addr, "unix://") || strings.HasSuffix(addr, ".sock") || strings.HasPrefix(addr, "/") || strings.HasPrefix(addr, "./") {
+		netType = "unix"
+		addr = strings.TrimPrefix(addr, "unix://")
 	}
+	return NewWithNetwork(netType, addr, limiter)
+}
 
+func NewWithNetwork(network, addr string, limiter Limiter) *Server {
 	return &Server{
-		addr:       addr,
-		limiter:    limiter,
-		maxTokens:  maxTok,
-		refillRate: refill,
-		sem:        make(chan struct{}, maxConnections),
+		network: network,
+		addr:    addr,
+		limiter: limiter,
+		sem:     make(chan struct{}, maxConnections),
 	}
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	listener, err := net.Listen("tcp", s.addr)
-	if err != nil {
-		return fmt.Errorf("failed to start listener: %w", err)
+	if s.network == "unix" {
+		_ = os.Remove(s.addr)
 	}
-	defer listener.Close()
 
-	fmt.Printf("TCP rate-limiter daemon listening on %s\n", s.addr)
+	listener, err := net.Listen(s.network, s.addr)
+	if err != nil {
+		return fmt.Errorf("failed to start %s listener on %s: %w", s.network, s.addr, err)
+	}
+	defer func() {
+		_ = listener.Close()
+		if s.network == "unix" {
+			_ = os.Remove(s.addr)
+		}
+	}()
+
+	if s.network == "unix" {
+		_ = os.Chmod(s.addr, 0666)
+	}
 
 	var wg sync.WaitGroup
 
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
-
+		if s.network == "unix" {
+			_ = os.Remove(s.addr)
+		}
 		s.conns.Range(func(key, _ any) bool {
 			if conn, ok := key.(net.Conn); ok {
 				_ = conn.Close()
@@ -81,31 +108,19 @@ func (s *Server) Run(ctx context.Context) error {
 		})
 	}()
 
-	var tempDelay time.Duration
-
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				break
 			}
-
-			if tempDelay == 0 {
-				tempDelay = 5 * time.Millisecond
-			} else {
-				tempDelay *= 2
-				if tempDelay > 1*time.Second {
-					tempDelay = 1 * time.Second
-				}
-			}
-			time.Sleep(tempDelay)
 			continue
 		}
-		tempDelay = 0
 
 		select {
 		case s.sem <- struct{}{}:
 		default:
+			atomic.AddUint64(&s.metrics.Dropped, 1)
 			_ = conn.Close()
 			continue
 		}
@@ -129,63 +144,90 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
-	reader := bufio.NewReaderSize(conn, 128)
-	writer := bufio.NewWriterSize(conn, 256)
-	buf := make([]byte, maxLineLen)
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	reader := bufio.NewReaderSize(conn, 2048)
+	writer := bufio.NewWriterSize(conn, 2048)
+	_ = conn.SetDeadline(time.Now().Add(idleTimeout))
+
+	var numBuf [20]byte
+	var statsBuf [160]byte
 
 	for {
-		n, err := readLineBounded(reader, buf)
+		if reader.Buffered() == 0 {
+			_ = conn.SetDeadline(time.Now().Add(idleTimeout))
+		}
+
+		rawLine, err := reader.ReadSlice('\n')
 		if err != nil {
 			return
 		}
 
-		_ = conn.SetDeadline(time.Now().Add(idleTimeout))
-		line := bytes.TrimSpace(buf[:n])
+		line := bytes.TrimSpace(rawLine)
 		if len(line) == 0 {
+			continue
+		}
+
+		if len(line) > maxLineLen {
+			atomic.AddUint64(&s.metrics.Invalid, 1)
+			if _, err := writer.Write(respInvalid); err != nil {
+				return
+			}
+			if reader.Buffered() == 0 {
+				_ = writer.Flush()
+			}
+			continue
+		}
+
+		if bytes.Equal(line, []byte("PING")) {
+			_, _ = writer.Write(respPong)
+			_ = writer.Flush()
+			continue
+		}
+
+		if bytes.Equal(line, []byte("STATS")) {
+			b := append(statsBuf[:0], "+OK allowed="...)
+			b = strconv.AppendUint(b, atomic.LoadUint64(&s.metrics.Allowed), 10)
+			b = append(b, " rejected="...)
+			b = strconv.AppendUint(b, atomic.LoadUint64(&s.metrics.Rejected), 10)
+			b = append(b, " invalid="...)
+			b = strconv.AppendUint(b, atomic.LoadUint64(&s.metrics.Invalid), 10)
+			b = append(b, " dropped="...)
+			b = strconv.AppendUint(b, atomic.LoadUint64(&s.metrics.Dropped), 10)
+			b = append(b, "\r\n"...)
+			_, _ = writer.Write(b)
+			_ = writer.Flush()
 			continue
 		}
 
 		strLine := unsafe.String(unsafe.SliceData(line), len(line))
 		key, ok := parseIPToKey(strLine)
 		if !ok {
+			atomic.AddUint64(&s.metrics.Invalid, 1)
 			if _, err := writer.Write(respInvalid); err != nil {
 				return
 			}
-		} else if s.limiter.Allow(key, s.maxTokens, s.refillRate) {
-			if _, err := writer.Write(respOK); err != nil {
-				return
-			}
 		} else {
-			if _, err := writer.Write(respErr); err != nil {
+			allowed, retryAfterMs := s.limiter.Allow(key)
+			if allowed {
+				atomic.AddUint64(&s.metrics.Allowed, 1)
+				if _, err := writer.Write(respOK); err != nil {
+					return
+				}
+			} else {
+				atomic.AddUint64(&s.metrics.Rejected, 1)
+				_, _ = writer.Write(respErrPref)
+				formatted := strconv.AppendInt(numBuf[:0], retryAfterMs, 10)
+				_, _ = writer.Write(formatted)
+				if _, err := writer.Write(crlf); err != nil {
+					return
+				}
+			}
+		}
+
+		if reader.Buffered() == 0 {
+			if err := writer.Flush(); err != nil {
 				return
 			}
 		}
-
-		if err := writer.Flush(); err != nil {
-			return
-		}
-	}
-}
-
-func readLineBounded(r *bufio.Reader, buf []byte) (int, error) {
-	var count int
-	for {
-		b, err := r.ReadByte()
-		if err != nil {
-			return 0, err
-		}
-		if b == '\n' {
-			if count > 0 && buf[count-1] == '\r' {
-				count--
-			}
-			return count, nil
-		}
-		if count >= len(buf) {
-			return 0, errors.New("line too long")
-		}
-		buf[count] = b
-		count++
 	}
 }
 
@@ -195,13 +237,7 @@ func parseIPToKey(raw string) (limiter.IPKey, bool) {
 		return limiter.IPKey{}, false
 	}
 
-	if addr.Is4() {
-		b := addr.As4()
-		ipNum := binary.BigEndian.Uint32(b[:])
-		return limiter.IPv4Key(ipNum), true
-	}
-
-	if addr.Is4In6() {
+	if addr.Is4() || addr.Is4In6() {
 		b := addr.As4()
 		ipNum := binary.BigEndian.Uint32(b[:])
 		return limiter.IPv4Key(ipNum), true
